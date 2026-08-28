@@ -421,7 +421,7 @@ ESP32-C3-MINI-1 对外可用：**GPIO0–GPIO10、GPIO18–GPIO21**（GPIO11–1
 | GPIO8 | 输出 | 状态 LED | ⚠️ strapping：10 kΩ 上拉；LED **低电平点亮** |
 | GPIO9 | 输入 | BOOT 按键 | ⚠️ strapping：10 kΩ 上拉，按键常开到 GND |
 | GPIO10 | 输入 | **编码器 B 相** | 10 kΩ 上拉 + 100 nF 滤波，**双边沿中断** |
-| GPIO18/19 | USB | 原生 USB Serial/JTAG（D−/D+） | 调试口 |
+| GPIO18/19 | — | **空闲（预留）** | 原生 USB 未使用，留测试焊盘，将来可接 USB-JTAG |
 | GPIO20/21 | UART | 烧录/日志 RX/TX | 排针引出 |
 
 **INA226 的 ALERT 不接**，改用 I²C 轮询（200 ms 一次，而 INA226 转换周期只有 35 ms，完全跟得上）。ALERT 只能提前几十毫秒告警，而风扇过流是秒级过程，没有价值。省下 GPIO10 给编码器 B 相。
@@ -448,7 +448,31 @@ A ──┬── GPIO1        C ── GND        B ──┬── GPIO10
 3. 这三个脚只接**本板器件**，不要接到风扇排线、显示屏排线等可插拔的东西上。
 4. **编码器 A 相 / B 相绝对不能放到 GPIO2 / GPIO8 / GPIO9**。编码器停在哪一格是随机的，某些定位点上 A 或 B 就是低电平 —— 上电必然进不了正常启动模式，这是**必然故障**而非偶发。按键放 GPIO2 可以：用户一般不会按着旋钮上电，真按住了也只是进下载模式，和 BOOT 键行为一致。
 
-> **引脚预算提示**：C3 可用 IO 只有 14 个，扣掉 USB/UART/strapping 后余量很紧，**显示屏必须走 I²C**（只占 2 根且与 INA226 共用总线）。若坚持要 SPI 彩屏（需 5–6 根），请改用 ESP32-S3-MINI-1。
+> **引脚预算提示**：C3 可用 IO 只有 15 个，扣掉 USB/UART/strapping 后余量很紧，**显示屏必须走 I²C**（只占 2 根且与 INA226 共用总线）。若坚持要 SPI 彩屏（需 4–6 根），请改用 ESP32-S3-MINI-1。
+
+**启动模式真值表**
+
+| GPIO2 | GPIO8 | GPIO9 | 模式 |
+|:---:|:---:|:---:|---|
+| 1 | × | 1 | **SPI Boot** —— 正常运行 |
+| 1 | 1 | 0 | **Download Boot** —— 烧录模式 |
+| 0 | × | × | 非法组合，芯片起不来 |
+
+**模块 EN（复位）电路 —— 必需，不能省**
+
+ESP32-C3-MINI-1 的 `EN` 是芯片复位输入，**必须外接延时 RC**，否则 3.3V 上升过程中芯片可能在电源未稳时就释放复位，出现随机启动失败。
+
+```
+3.3V ──[ 10kΩ ]──┬── 模块 EN
+                  │
+              [ 1µF ]     ← 必须紧贴 EN 脚
+                  │
+                 GND
+                  │
+        RESET 按键 ── EN 到 GND
+```
+
+RC 时间常数 10 ms，保证 EN 在 3.3V 稳定后才拉高。RESET 按键配合 BOOT 键做手动进入下载模式（见 §6.5）。
 
 ---
 
@@ -608,6 +632,133 @@ void IRAM_ATTR tachIsr() {
 | 双击 | 两次短按间隔 < 300 ms | 切换显示页 |
 | 长按 | 按住 ≥ 2000 ms | 风扇开 / 关 |
 
+### 6.5 固件烧录与调试
+
+**Type-C（J1）只做供电，不做数据。烧录和串口一律走 J5 排针 + 四脚 CH340 模块。**
+
+| 项目 | 内容 |
+|---|---|
+| 接口 | J5（2.54mm 4P） |
+| 引脚 | GPIO21 = TXD，GPIO20 = RXD |
+| 外部器件 | **四脚 CH340 模块**（`VCC/GND/TX/RX`），十块钱以内 |
+| 波特率 | 烧录 460800（不稳降到 115200）；日志 115200 |
+| 供电 | 由 Type-C 提供。**不要接 CH340 模块的 5V/3V3** |
+
+**接线（三根）**
+
+```
+CH340 模块           J5
+   GND   ─────────  Pin2 GND
+   RXD   ─────────  Pin3 TXD (GPIO21)     ← 交叉
+   TXD   ─────────  Pin4 RXD (GPIO20)     ← 交叉
+   （VCC 不接）      Pin1 3V3  ← 常态空置
+```
+
+**TX/RX 必须交叉**：板子的 TXD 接模块的 RXD。接成同名对同名是"完全烧不进、报错还毫无指向性"的第一大原因。
+
+> ⚠️ **Pin1 的 3V3 常态不接**。板子由 Type-C 供电，再从 CH340 灌一路电进来会互相倒灌。这一脚只在"完全不插 Type-C、纯靠模块供电"时才用（此时风扇不转，仅够 MCU 跑），两种供电方式**绝不能同时**。
+
+**这样分工的好处**：TTL 通路与供电口互不相干，所以 **PD 插着、风扇满速运转的同时串口日志照样在刷** —— 调 PI 参数、抓堵转误判、看编码器丢步都能拿到实时现场。若把 Type-C 拿去做 USB 数据，就得"拔 PD 才能连电脑"，风扇一转反而是瞎的。
+
+> ESP32-C3 内置的 USB Serial/JTAG 外设（GPIO18/19）本设计**没有使用**，那两脚空着并留了测试焊盘。将来若需要断点调试，飞一个 USB 座到 GPIO18/19 即可，不需要外部调试器。
+
+**进入下载模式**
+
+四脚 CH340 没有 DTR/RTS，所以没有硬件自动复位。两条路：
+
+**① 手动按键（默认）**
+
+```
+1. 按住 BOOT (GPIO9)
+2. 按一下 RESET 再松开
+3. 松开 BOOT
+4. 立刻执行烧录命令
+```
+
+原理就是启动模式真值表那一行：复位瞬间 GPIO9 = 0 → Download Boot。
+
+**② 软件命令（推荐）**：固件里挂一条串口魔术命令，芯片自己重启进下载模式，连按键都不用。
+
+```c
+#include "soc/rtc_cntl_reg.h"
+
+void enter_download_mode(void)   // 收到 "reboot_bl\n" 时调用
+{
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+    esp_restart();
+}
+```
+
+代价是依赖"当前固件还活着"。固件跑飞了仍然只能按键，所以 **BOOT / RESET 按键必须保留**。
+
+> **第一版固件里先验证这个寄存器位**：调用后看 esptool 能不能连上。不同 IDF 版本宏名可能有差异，找不到就去 `components/soc/esp32c3/include/soc/rtc_cntl_reg.h` 里搜 `FORCE_DOWNLOAD_BOOT`。
+
+**ESP-IDF**
+
+```bash
+idf.py set-target esp32c3
+idf.py menuconfig          # Flash size = 4MB；console 选 UART0
+idf.py build
+idf.py -p COM5 flash monitor            # Windows
+idf.py -p /dev/ttyUSB0 flash monitor    # Linux（CH340 是 ttyUSB*）
+```
+
+menuconfig 必须确认两项，否则 J5 上看不到日志：
+
+- `Serial flasher config → Flash size` = **4 MB**
+- `Component config → ESP System Settings → Channel for console output` = **Default: UART0**
+
+**底层 esptool（应急用）**
+
+```bash
+esptool.py --chip esp32c3 chip_id       # 连通性自检，第一次点板子先跑这条
+esptool.py --chip esp32c3 erase_flash   # 整片擦除，变砖时救命
+
+esptool.py --chip esp32c3 -b 460800 --before default_reset --after hard_reset \
+  write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB \
+  0x0     bootloader.bin \
+  0x8000  partition-table.bin \
+  0x10000 fan.bin
+```
+
+> ⚠️ **C3 的 bootloader 烧在 `0x0`，不是 `0x1000`**。ESP32（原版）是 0x1000，照抄会烧不起来。C3 / S3 都是 0x0。
+
+**Arduino IDE（若用 Arduino）**
+
+| 设置项 | 值 |
+|---|---|
+| Board | ESP32C3 Dev Module |
+| **USB CDC On Boot** | **Disabled** ← 本设计走 UART，必须关 |
+| Flash Size | 4MB (32Mb) |
+| Partition Scheme | Default 4MB with spiffs |
+| Upload Speed | 460800（不稳降到 115200） |
+
+> **这里和用原生 USB 的板子正好相反**：`USB CDC On Boot` 要**关**，`Serial` 才会走 UART0（GPIO20/21）到 J5。开着的话 `Serial.print()` 跑去原生 USB，J5 上什么都收不到 —— 网上绝大多数 C3 教程都叫你打开这一项，照抄会掉坑。
+
+**Type-C 上插什么都能开发**
+
+| 插什么 | VBUS | 12V 轨 | MCU | 风扇 | 烧录/日志 |
+|---|---|---|:---:|:---:|:---:|
+| PD 充电头（12V） | 12V | 12V | ✔ | ✔ 能转 | ✔ 走 J5 |
+| 普通 5V 充电头 / 电脑 USB 口 | 5V | ~4.5V | ✔ | ✘ 不转 | ✔ 走 J5 |
+
+不需要 12V 的场合（改 UI、调 I²C、写 Wi-Fi）用任意 5V 源供电即可，**风扇不转，桌面很安静**；要联调风扇再换成 PD 头。
+
+**烧录故障排查**
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `Failed to connect: No serial data received` | **TX/RX 没交叉**（最常见） | 板子 TXD ↔ 模块 RXD、板子 RXD ↔ 模块 TXD |
+| 同上，但接线确认没错 | 芯片没进下载模式 | 按住 BOOT → 点 RESET → 松开 BOOT，再立刻执行命令 |
+| 同上，且板子完全没上电 | 忘了插 Type-C | CH340 模块不供电，电源一律来自 Type-C |
+| 串口监视器无输出 | Arduino 开了 USB CDC On Boot；或 IDF console 配成了 USB Serial/JTAG | 本设计要**关** CDC / 选 UART0 |
+| 日志全是乱码 | 波特率不对 | 日志 115200；烧录 460800 不稳降到 115200 |
+| 一直停在下载模式 | GPIO9 被拉低 | 查 GPIO9 的 10 kΩ 上拉；查 BOOT 键是否卡住 |
+| 不启动也进不了下载模式 | GPIO2 或 GPIO8 上电为低 | 查两者上拉；**确认编码器 A/B 没误接到 strapping 脚** |
+| 烧录中途断开 | 3.3V 瞬时跌落 | 补足 LDO 输出电容（§2.3），别只放 1 µF |
+| 随机启动失败 | EN 复位 RC 缺失或电容太远 | 装 10 kΩ + 1 µF，且 1 µF 紧贴 EN 脚（§3） |
+| 板子和电脑共地不良 | 只接了 TX/RX 没接 GND | J5.Pin2 必须接模块 GND |
+
 ---
 
 ## 7. 校准与测试计划
@@ -654,7 +805,10 @@ void IRAM_ATTR tachIsr() {
 | 21 | 陶瓷电容 | 100 µF/25V 固态 | - | 1 | 风扇支路 bulk（**不要放在 VBUS 上**） |
 | 22 | 电阻 | 24k(CFG1)/56k/10k(FB)/10k×6(上拉)/4.7k×2(I2C)/1k×3/10Ω×2 | 0402/0603 1% | 若干 | 见各节 |
 | 23 | 旋转编码器 | EC11（带按键，5脚） | 立式 | 1 | 调速 + 模式切换 |
-| 24 | 按键 | 轻触开关 | 3×4 | 1 | BOOT |
+| 24 | 按键 | 轻触开关 | 3×4 | 2 | BOOT（GPIO9）+ RESET（模块 EN） |
+| 25 | 复位 RC | 10 kΩ + 1 µF | 0402/0603 | 各1 | 模块 EN 延时复位，**1µF 紧贴 EN 脚** |
+| 26 | 排针 | 2.54mm 4P（J5） | 直针 | 1 | 烧录+串口：3V3/GND/TXD/RXD |
+| 27 | USB-TTL | **四脚 CH340 模块** | 模块 | 1 | 外购，烧录用，非板载 |
 
 ---
 
@@ -677,7 +831,7 @@ void IRAM_ATTR tachIsr() {
 10. **风扇 PWM 20% 下限**：规范未定义 <20% 行为，软件把占空比下限钳位在 20%（除非实测风扇支持停转）。需要真正停转时用高边开关断电。
 11. **PWM 反相**：NMOS 开漏驱动会反相，固件必须补偿，否则调速方向是反的。
 12. **Tach 电平先验证**：极少数非标风扇的 Tach 是推挽 12V 输出，直连会打穿 3.3V GPIO。接 MCU 前先量一次（见 §7 第 5 步）。
-13. **调试供电隔离**：Super Mini 板载 USB 与本机 12V 严禁并联；建议直接用模组 + 原生 USB(GPIO18/19) 或 UART 烧录。
+13. **调试供电隔离**：CH340 模块只接 GND/TX/RX 三根，**不要接它的 VCC** —— 板子电源一律来自 Type-C，两路电源顶在一起会互相倒灌。
 
 ---
 
